@@ -14,6 +14,7 @@
 - 账号信息查询：从 `apim/user/UserHandler.ashx`（失败时回退 `mobile/ajax/user/UserHandler.ashx`）读取 `user_name` 与 `real_name`。
 - 座位预约：支持立即预约与“次日 07:00 定时预约”。
 - 时间选择：小时范围仅 07–22，分钟仅 00/30（半小时粒度）。
+- 值得说明的是，对于别的学校，我认为只要是通过微信公众号进入第三方网站(这里是libwx.hunnu.edu.cn)，那么底层逻辑是一样的，只有稍作修改就可以使用。具体如湖南农大，湖南大学。
 
 ## 运行环境
 - 语言与框架：Python 3.x，Flask，Requests。
