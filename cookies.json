@@ -1,0 +1,38 @@
+[
+  {
+    "domain": ".libwx.hunnu.edu.cn",
+    "httpOnly": false,
+    "name": "cookie_unit_name",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": true,
+    "value": "%e6%b9%96%e5%8d%97%e5%b8%88%e8%8c%83%e5%a4%a7%e5%ad%a6%e5%9b%be%e4%b9%a6%e9%a6%86"
+  },
+  {
+    "domain": "libwx.hunnu.edu.cn",
+    "httpOnly": false,
+    "name": "cookie_unit_name",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "%e6%b9%96%e5%8d%97%e5%b8%88%e8%8c%83%e5%a4%a7%e5%ad%a6%e5%9b%be%e4%b9%a6%e9%a6%86"
+  },
+  {
+    "domain": ".libwx.hunnu.edu.cn",
+    "httpOnly": false,
+    "name": "cookie_come_app",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": true,
+    "value": "D935AE54952F16C1"
+  },
+  {
+    "domain": "libwx.hunnu.edu.cn",
+    "httpOnly": false,
+    "name": "cookie_come_app",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "D935AE54952F16C1"
+  }
+]
