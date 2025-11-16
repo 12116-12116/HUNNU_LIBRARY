@@ -5,6 +5,7 @@ import threading
 import time
 import requests
 import urllib3
+import re
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -318,7 +319,27 @@ def api_book():
                 return jsonify(j)
             try:
                 url_rec = f'{BASE}/apim/seat/SeatInfoHandler.ashx'
-                rrec = s.get(url_rec, headers=headers, timeout=10)
+                sn = (seatno or '').upper()
+                areacode = 'HUNNU_ELB'
+                prefix = ''
+                if sn.startswith('NY01'):
+                    areacode = 'HUNNU_NY'
+                    prefix = 'NY01'
+                elif sn.startswith('THP'):
+                    areacode = 'HUNNU_THP'
+                    prefix = 'THP'
+                elif sn.startswith('X'):
+                    areacode = 'HUNNU_XYH'
+                    prefix = 'X'
+                elif sn.startswith('Z'):
+                    areacode = 'HUNNU_ELB'
+                    prefix = 'Z'
+                addresscode = ''
+                if prefix:
+                    m = re.match(prefix + r"(\d{3})", sn)
+                    addresscode = prefix + (m.group(1) if m else '')
+                form = {'data_type':'GetTuiJianSeat','areacode':areacode,'addresscode':addresscode,'seatdate':seatdate}
+                rrec = s.post(url_rec, headers=headers, data=form, timeout=10)
                 jrec = rrec.json()
                 seats = []
                 if jrec.get('code') == 0:
