@@ -6,6 +6,7 @@ import time
 import requests
 import urllib3
 import re
+import uuid
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -13,16 +14,235 @@ app = Flask(__name__)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 COOKIES_BY_CLIENT = {}
+SCHEDULED_JOBS = {}
+SCHEDULED_RESULTS = {}
+
+def cookie_header_from_list(arr):
+    best_idx = {}
+    for i, c in enumerate(arr or []):
+        name = (c.get('name') or '').strip()
+        value = (c.get('value') or '').strip()
+        if not name or not value:
+            continue
+        domain = (c.get('domain') or '').strip().lower()
+        score = 0
+        if domain == 'libwx.hunnu.edu.cn':
+            score = 2
+        elif domain == '.libwx.hunnu.edu.cn':
+            score = 1
+        prev = best_idx.get(name)
+        if prev is None or score > prev[0] or (score == prev[0] and i > prev[1]):
+            best_idx[name] = (score, i, value)
+    out = []
+    seen = set()
+    for i, c in enumerate(arr or []):
+        name = (c.get('name') or '').strip()
+        if not name or name in seen:
+            continue
+        chosen = best_idx.get(name)
+        if chosen and chosen[1] == i:
+            out.append(f"{name}={chosen[2]}")
+            seen.add(name)
+    for name, (_, i, value) in best_idx.items():
+        if name not in seen:
+            out.append(f"{name}={value}")
+            seen.add(name)
+    return '; '.join(out)
 
 def load_cookie_header(client_id=None):
     if client_id and client_id in COOKIES_BY_CLIENT:
         arr = COOKIES_BY_CLIENT[client_id]
-        return '; '.join([f"{c['name']}={c['value']}" for c in arr])
+        return cookie_header_from_list(arr)
     try:
         cookies = json.load(open('cookies.json','r',encoding='utf-8'))
-        return '; '.join([f"{c['name']}={c['value']}" for c in cookies])
+        return cookie_header_from_list(cookies)
     except Exception:
         return ''
+
+def is_occupied_msg(msg):
+    m = (msg or '')
+    return ('被预约' in m) or ('已有预约' in m) or ('已被预约' in m)
+
+def infer_recommend_params(seatno, seatdate):
+    sn = (seatno or '').upper()
+    areacode = 'HUNNU_ELB'
+    prefix = ''
+    if sn.startswith('NY01'):
+        areacode = 'HUNNU_NY'
+        prefix = 'NY01'
+    elif sn.startswith('THP'):
+        areacode = 'HUNNU_THP'
+        prefix = 'THP'
+    elif sn.startswith('X'):
+        areacode = 'HUNNU_XYH'
+        prefix = 'X'
+    elif sn.startswith('Z'):
+        areacode = 'HUNNU_ELB'
+        prefix = 'Z'
+    addresscode = ''
+    if prefix:
+        m = re.match(prefix + r"(\d{3})", sn)
+        addresscode = prefix + (m.group(1) if m else '')
+    return {'data_type':'GetTuiJianSeat','areacode':areacode,'addresscode':addresscode,'seatdate':seatdate}
+
+def read_seat_preferences():
+    prefs = []
+    with open('seat_preferences.txt','r',encoding='utf-8') as f:
+        txt = f.read()
+        for token in txt.replace(',', ' ').split():
+            t = token.strip()
+            if t:
+                prefs.append(t)
+    return prefs
+
+def conflict_with_range(show, dt):
+    t = (show or '').strip()
+    if not t or t == '暂无预约':
+        return False
+    try:
+        parts = t.split('-')
+        if len(parts) != 2:
+            return False
+        def parse_one(x):
+            hm = x.strip().split(':')
+            return int(hm[0])*60+int(hm[1])
+        s1 = parse_one(parts[0])
+        e1 = parse_one(parts[1])
+        s2 = int(dt[0])
+        e2 = int(dt[1])
+        return not (e2 <= s1 or s2 >= e1)
+    except Exception:
+        return True
+
+def seat_date_request(session, headers, seatno, seatdate, dt):
+    url = f'{BASE}/apim/seat/SeatDateHandler.ashx'
+    params = {'data_type':'seatDate','seatno':seatno,'seatdate':seatdate,'datetime':f"{dt[0]},{dt[1]}"}
+    
+    # 增加自动重试机制：应对本地时间快于服务器时间导致"未到7点"被拒的情况
+    for i in range(6):
+        try:
+            r = session.get(url, headers=headers, params=params, timeout=10)
+            j = r.json()
+            msg = j.get('msg', '') or ''
+            # 如果是"时间未到"类错误，且不是最后一次尝试，则等待后重试
+            if j.get('code') != 0 and '07:00' in msg and i < 5:
+                time.sleep(0.5)
+                continue
+            return j
+        except Exception:
+            if i < 5:
+                time.sleep(0.5)
+                continue
+            return {'code':-1,'msg':'接口返回异常','status':r.status_code if 'r' in locals() else 0, 'raw': str(e) if 'e' in locals() else ''}
+    return {'code':-1,'msg':'重试多次失败'}
+
+def do_booking(seatno, seatdate, dt, content, client_id):
+    s = make_session()
+    headers = dict(HEADERS)
+    headers['Cookie'] = load_cookie_header(client_id)
+    if content == 'prefs' and not seatno:
+        try:
+            prefs = read_seat_preferences()
+            if not prefs:
+                return {'code':-1,'msg':'偏好文件为空'}
+            for code in prefs:
+                j2 = seat_date_request(s, headers, code, seatdate, dt)
+                if j2.get('code') == 0:
+                    return {'code':0,'msg':'已使用偏好座位预约成功','seatno':code,'data':j2}
+                if not is_occupied_msg(j2.get('msg','')):
+                    return j2
+            return {'code':-1,'msg':'偏好座位均不可用'}
+        except Exception:
+            return {'code':-1,'msg':'读取偏好文件失败'}
+    j = seat_date_request(s, headers, seatno, seatdate, dt)
+    if content == 'current':
+        if j.get('code') == 0 or not is_occupied_msg(j.get('msg','')):
+            return j
+        try:
+            url_rec = f'{BASE}/apim/seat/SeatInfoHandler.ashx'
+            form = infer_recommend_params(seatno, seatdate)
+            rrec = s.post(url_rec, headers=headers, data=form, timeout=10)
+            jrec = rrec.json()
+            seats = []
+            if jrec.get('code') == 0:
+                seats = json.loads(jrec.get('data','[]'))
+            for it in seats:
+                code = it.get('Code','')
+                show = it.get('ShowDataTime','')
+                if not code:
+                    continue
+                if conflict_with_range(show, dt):
+                    continue
+                j2 = seat_date_request(s, headers, code, seatdate, dt)
+                if j2.get('code') == 0:
+                    return {'code':0,'msg':'已使用推荐座位预约成功','seatno':code,'data':j2}
+            return {'code':-1,'msg':'推荐座位尝试失败'}
+        except Exception:
+            return j
+    if content == 'prefs':
+        if j.get('code') == 0 or not is_occupied_msg(j.get('msg','')):
+            return j
+        try:
+            prefs = read_seat_preferences()
+            if not prefs:
+                return {'code':-1,'msg':'偏好文件为空'}
+            seen = {seatno} if seatno else set()
+            for code in prefs:
+                if code in seen:
+                    continue
+                seen.add(code)
+                j2 = seat_date_request(s, headers, code, seatdate, dt)
+                if j2.get('code') == 0:
+                    return {'code':0,'msg':'已使用偏好座位预约成功','seatno':code,'data':j2}
+                if not is_occupied_msg(j2.get('msg','')):
+                    return j2
+            return {'code':-1,'msg':'偏好座位均不可用'}
+        except Exception:
+            return {'code':-1,'msg':'读取偏好文件失败'}
+    return j
+
+def schedule_booking(job_id, target, payload, client_id):
+    delay = (target - datetime.datetime.now()).total_seconds()
+    run_seatdate = target.date().strftime('%Y-%m-%d')
+    job = {
+        'job_id': job_id,
+        'client_id': client_id,
+        'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'scheduled_for': target.strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'pending',
+        'payload': {
+            'seatno': payload.get('seatno', ''),
+            'seatdate': payload.get('seatdate', ''),
+            'seatdate_run': run_seatdate,
+            'datetime': payload.get('datetime', [0, 0]),
+            'content': payload.get('content', 'current'),
+            'mode': payload.get('mode', ''),
+        }
+    }
+    SCHEDULED_JOBS[job_id] = job
+
+    def run_later():
+        job['status'] = 'running'
+        job['started_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            seatno = job['payload'].get('seatno', '')
+            dt = job['payload'].get('datetime', [0, 0])
+            content = job['payload'].get('content', 'current')
+            seatdate = job['payload'].get('seatdate_run', run_seatdate)
+            res = do_booking(seatno, seatdate, dt, content, client_id)
+            job['status'] = 'done'
+            job['finished_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            SCHEDULED_RESULTS[job_id] = res
+        except Exception as e:
+            job['status'] = 'failed'
+            job['finished_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            SCHEDULED_RESULTS[job_id] = {'code': -1, 'msg': '定时任务执行异常', 'error': str(e)}
+
+    timer = threading.Timer(max(0, delay), run_later)
+    timer.daemon = False
+    timer.start()
+    SCHEDULED_JOBS[job_id]['timer_started'] = True
+    return job
 
 def make_session():
     s = requests.Session()
@@ -179,7 +399,9 @@ document.getElementById('roomInput').addEventListener('change',noop);
 
 function toMinutes(t){const [h,m]=t.split(':');return parseInt(h)*60+parseInt(m)}
 
+let pollTimer=null;
 async function book(){
+  if(pollTimer){clearTimeout(pollTimer);pollTimer=null}
   const seatTyped=document.getElementById('seatInput').value.trim();
   const room=document.getElementById('roomInput').value.trim();
   let seat=seatTyped;
@@ -196,6 +418,36 @@ async function book(){
   const r=await fetch('/api/book',{method:'POST',headers:{'Content-Type':'application/json','X-Client-Id':clientId},body:JSON.stringify({seatno:seat,seatdate:date,datetime:[start,end],mode,content})});
   const j=await r.json();
   document.getElementById('out').textContent=JSON.stringify(j,null,2);
+  if(j.code===0 && j.job_id && j.scheduled_for){
+    const target=new Date(j.scheduled_for.replace(/-/g,'/'));
+    const now=new Date();
+    const delay=target-now;
+    if(delay>0){
+      const out=document.getElementById('out');
+      out.textContent+='\n\n[系统] 定时任务已创建，请保持页面开启，将在执行后自动更新结果...';
+      const waitMs=Math.max(0,delay-60000);
+      pollTimer=setTimeout(()=>startPolling(j.job_id),waitMs);
+    }else{
+      startPolling(j.job_id);
+    }
+  }
+}
+async function startPolling(jobId){
+  const out=document.getElementById('out');
+  const check=async()=>{
+    try{
+      const r=await fetch('/api/scheduled',{headers:{'X-Client-Id':clientId}});
+      const jobs=await r.json();
+      const job=jobs.find(x=>x.job_id===jobId);
+      if(job && (job.status==='done'||job.status==='failed')){
+        out.textContent=`[系统] 任务已执行 (状态: ${job.status})\n执行结果:\n`+JSON.stringify(job.result,null,2);
+        pollTimer=null;
+        return;
+      }
+    }catch(e){}
+    pollTimer=setTimeout(check,2000);
+  };
+  check();
 }
 
 noop();
@@ -274,178 +526,45 @@ def api_book():
     dt = payload.get('datetime',[0,0])
     mode = payload.get('mode','now')
     content = payload.get('content','current')
-    s = make_session()
-    headers = dict(HEADERS)
-    headers['Cookie'] = load_cookie_header(request.headers.get('X-Client-Id'))
-    url = f'{BASE}/apim/seat/SeatDateHandler.ashx'
-    params = {'data_type':'seatDate','seatno':seatno,'seatdate':seatdate,'datetime':f"{dt[0]},{dt[1]}"}
+    client_id = request.headers.get('X-Client-Id')
     if mode == 'now':
-        if content == 'prefs' and not seatno:
-            try:
-                prefs = []
-                with open('seat_preferences.txt','r',encoding='utf-8') as f:
-                    txt = f.read()
-                    for token in txt.replace(',', ' ').split():
-                        t = token.strip()
-                        if t:
-                            prefs.append(t)
-                if not prefs:
-                    return jsonify({'code':-1,'msg':'偏好文件为空'})
-                for code in prefs:
-                    params2 = {'data_type':'seatDate','seatno':code,'seatdate':seatdate,'datetime':f"{dt[0]},{dt[1]}"}
-                    r2 = s.get(url, headers=headers, params=params2, timeout=10)
-                    try:
-                        j2 = r2.json()
-                    except Exception:
-                        continue
-                    msg2 = (j2.get('msg','') or '')
-                    occupied2 = ('被预约' in msg2) or ('已有预约' in msg2) or ('已被预约' in msg2)
-                    if j2.get('code') == 0:
-                        return jsonify({'code':0,'msg':'已使用偏好座位预约成功','seatno':code,'data':j2})
-                    if not occupied2:
-                        return jsonify(j2)
-                return jsonify({'code':-1,'msg':'偏好座位均不可用'})
-            except Exception:
-                return jsonify({'code':-1,'msg':'读取偏好文件失败'})
-        r = s.get(url, headers=headers, params=params, timeout=10)
-        try:
-            j = r.json()
-        except Exception:
-            return jsonify({'code':-1,'msg':'接口返回异常','status':r.status_code,'content_type':r.headers.get('content-type',''), 'raw': r.text[:500]})
-        if content == 'current':
-            msg1 = (j.get('msg','') or '')
-            occupied1 = ('被预约' in msg1) or ('已有预约' in msg1) or ('已被预约' in msg1)
-            if j.get('code') == 0 or not occupied1:
-                return jsonify(j)
-            try:
-                url_rec = f'{BASE}/apim/seat/SeatInfoHandler.ashx'
-                sn = (seatno or '').upper()
-                areacode = 'HUNNU_ELB'
-                prefix = ''
-                if sn.startswith('NY01'):
-                    areacode = 'HUNNU_NY'
-                    prefix = 'NY01'
-                elif sn.startswith('THP'):
-                    areacode = 'HUNNU_THP'
-                    prefix = 'THP'
-                elif sn.startswith('X'):
-                    areacode = 'HUNNU_XYH'
-                    prefix = 'X'
-                elif sn.startswith('Z'):
-                    areacode = 'HUNNU_ELB'
-                    prefix = 'Z'
-                addresscode = ''
-                if prefix:
-                    m = re.match(prefix + r"(\d{3})", sn)
-                    addresscode = prefix + (m.group(1) if m else '')
-                form = {'data_type':'GetTuiJianSeat','areacode':areacode,'addresscode':addresscode,'seatdate':seatdate}
-                rrec = s.post(url_rec, headers=headers, data=form, timeout=10)
-                jrec = rrec.json()
-                seats = []
-                if jrec.get('code') == 0:
-                    seats = json.loads(jrec.get('data','[]'))
-                def conflict(show):
-                    t = (show or '').strip()
-                    if not t or t == '暂无预约':
-                        return False
-                    try:
-                        parts = t.split('-')
-                        if len(parts) != 2:
-                            return False
-                        def parse_one(x):
-                            hm = x.strip().split(':')
-                            return int(hm[0])*60+int(hm[1])
-                        s1 = parse_one(parts[0])
-                        e1 = parse_one(parts[1])
-                        s2 = int(dt[0])
-                        e2 = int(dt[1])
-                        return not (e2 <= s1 or s2 >= e1)
-                    except Exception:
-                        return True
-                for it in seats:
-                    code = it.get('Code','')
-                    show = it.get('ShowDataTime','')
-                    if not code:
-                        continue
-                    if conflict(show):
-                        continue
-                    params2 = {'data_type':'seatDate','seatno':code,'seatdate':seatdate,'datetime':f"{dt[0]},{dt[1]}"}
-                    r2 = s.get(url, headers=headers, params=params2, timeout=10)
-                    try:
-                        j2 = r2.json()
-                    except Exception:
-                        continue
-                    if j2.get('code') == 0:
-                        return jsonify({'code':0,'msg':'已使用推荐座位预约成功','seatno':code,'data':j2})
-                return jsonify({'code':-1,'msg':'推荐座位尝试失败'})
-            except Exception:
-                return jsonify(j)
-        elif content == 'prefs':
-            msg1 = (j.get('msg','') or '')
-            occupied1 = ('被预约' in msg1) or ('已有预约' in msg1) or ('已被预约' in msg1)
-            if j.get('code') == 0 or not occupied1:
-                return jsonify(j)
-            try:
-                prefs = []
-                with open('seat_preferences.txt','r',encoding='utf-8') as f:
-                    txt = f.read()
-                    for token in txt.replace(',', ' ').split():
-                        t = token.strip()
-                        if t:
-                            prefs.append(t)
-                if not prefs:
-                    return jsonify({'code':-1,'msg':'偏好文件为空'})
-                for code in prefs:
-                    params2 = {'data_type':'seatDate','seatno':code,'seatdate':seatdate,'datetime':f"{dt[0]},{dt[1]}"}
-                    r2 = s.get(url, headers=headers, params=params2, timeout=10)
-                    try:
-                        j2 = r2.json()
-                    except Exception:
-                        continue
-                    msg2 = (j2.get('msg','') or '')
-                    occupied2 = ('被预约' in msg2) or ('已有预约' in msg2) or ('已被预约' in msg2)
-                    if j2.get('code') == 0:
-                        return jsonify({'code':0,'msg':'已使用偏好座位预约成功','seatno':code,'data':j2})
-                    if not occupied2:
-                        return jsonify(j2)
-                return jsonify({'code':-1,'msg':'偏好座位均不可用'})
-            except Exception:
-                return jsonify({'code':-1,'msg':'读取偏好文件失败'})
+        return jsonify(do_booking(seatno, seatdate, dt, content, client_id))
     elif mode == 'next7':
         now = datetime.datetime.now()
         target = (now + datetime.timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
-        delay = (target - now).total_seconds()
-        def run_later():
-            try:
-                s2 = make_session()
-                headers2 = dict(headers)
-                r2 = s2.get(url, headers=headers2, params=params, timeout=10)
-                # 无需返回，作为后台执行
-            except Exception:
-                pass
-        timer = threading.Timer(max(0, delay), run_later)
-        timer.daemon = True
-        timer.start()
-        return jsonify({'code':0,'msg':'已安排在明日07:00执行','scheduled_for': target.strftime('%Y-%m-%d %H:%M:%S'), 'seatno': seatno, 'seatdate': seatdate, 'datetime': dt})
+        job_id = uuid.uuid4().hex
+        job = schedule_booking(job_id, target, payload, client_id)
+        return jsonify({'code': 0, 'msg': '已安排在明日07:00执行', 'job_id': job_id, 'scheduled_for': job['scheduled_for'], 'seatdate_run': job['payload']['seatdate_run']})
     elif mode == 'next7_normal':
         now = datetime.datetime.now()
         base = (now + datetime.timedelta(days=1)).replace(hour=7, minute=0, second=5, microsecond=0)
         jitter = random.gauss(0, 1)
         target = base + datetime.timedelta(seconds=jitter)
-        delay = (target - now).total_seconds()
-        def run_later():
-            try:
-                s2 = make_session()
-                headers2 = dict(headers)
-                s2.get(url, headers=headers2, params=params, timeout=10)
-            except Exception:
-                pass
-        timer = threading.Timer(max(0, delay), run_later)
-        timer.daemon = True
-        timer.start()
-        return jsonify({'code':0,'msg':'已安排在明日7点过几秒执行','scheduled_for': target.strftime('%Y-%m-%d %H:%M:%S'), 'jitter_seconds': jitter, 'distribution': 'normal(base=07:00:05,sigma=1s)', 'seatno': seatno, 'seatdate': seatdate, 'datetime': dt})
+        job_id = uuid.uuid4().hex
+        job = schedule_booking(job_id, target, payload, client_id)
+        return jsonify({'code': 0, 'msg': '已安排在明日7点过几秒执行', 'job_id': job_id, 'scheduled_for': job['scheduled_for'], 'jitter_seconds': jitter, 'distribution': 'normal(base=07:00:05,sigma=1s)', 'seatdate_run': job['payload']['seatdate_run']})
     else:
         return jsonify({'code':-1,'msg':'未知执行方式'})
+
+@app.get('/api/scheduled')
+def api_scheduled():
+    cid = request.headers.get('X-Client-Id')
+    jobs = []
+    for job_id, job in SCHEDULED_JOBS.items():
+        if cid and job.get('client_id') != cid:
+            continue
+        item = {
+            'job_id': job_id,
+            'scheduled_for': job.get('scheduled_for', ''),
+            'created_at': job.get('created_at', ''),
+            'status': job.get('status', ''),
+            'payload': job.get('payload', {}),
+        }
+        if job_id in SCHEDULED_RESULTS:
+            item['result'] = SCHEDULED_RESULTS[job_id]
+        jobs.append(item)
+    jobs.sort(key=lambda x: x.get('scheduled_for', ''))
+    return jsonify(jobs)
 
 @app.get('/api/verify')
 def api_verify():
